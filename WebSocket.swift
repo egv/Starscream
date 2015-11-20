@@ -3,19 +3,6 @@
 //  Websocket.swift
 //
 //  Created by Dalton Cherry on 7/16/14.
-//  Copyright (c) 2014-2015 Dalton Cherry.
-//
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//  http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
 //
 //////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -32,6 +19,7 @@ public protocol WebSocketDelegate: class {
 
 public protocol WebSocketPongDelegate: class {
     func websocketDidReceivePong(socket: WebSocket)
+    func websocketDidReceivePing(socket: WebSocket)
 }
 
 public class WebSocket : NSObject, NSStreamDelegate {
@@ -104,6 +92,7 @@ public class WebSocket : NSObject, NSStreamDelegate {
     public var onText: ((String) -> Void)?
     public var onData: ((NSData) -> Void)?
     public var onPong: ((Void) -> Void)?
+    public var onPing: ((Void) -> Void)?
     public var headers = Dictionary<String,String>()
     public var voipEnabled = false
     public var selfSignedSSL = false
@@ -129,7 +118,10 @@ public class WebSocket : NSObject, NSStreamDelegate {
     public init(url: NSURL) {
         self.url = url
         writeQueue.maxConcurrentOperationCount = 1
+        writeQueue.qualityOfService = .UserInteractive
+        writeQueue.underlyingQueue = dispatch_get_main_queue()
     }
+    
     //used for setting protocols.
     public convenience init(url: NSURL, protocols: Array<String>) {
         self.init(url: url)
@@ -150,29 +142,14 @@ public class WebSocket : NSObject, NSStreamDelegate {
             self?.isCreated = false
         })
     }
-
-    /**
-     Disconnect from the server. I send a Close control frame to the server, then expect the server to respond with a Close control frame and close the socket from its end. I notify my delegate once the socket has been closed.
-     
-     If you supply a non-nil `forceTimeout`, I wait at most that long (in seconds) for the server to close the socket. After the timeout expires, I close the socket and notify my delegate.
-     
-     If you supply a zero (or negative) `forceTimeout`, I immediately close the socket (without sending a Close control frame) and notify my delegate.
-     
-     - Parameter forceTimeout: Maximum time to wait for the server to close the socket.
-    */
-    public func disconnect(forceTimeout forceTimeout: NSTimeInterval? = nil) {
-        switch forceTimeout {
-            case .Some(let seconds) where seconds > 0:
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, Int64(seconds * Double(NSEC_PER_SEC))), queue, { [unowned self] in
-                    self.disconnectStream(nil)
-                    })
-                fallthrough
-            case .None:
-                writeError(CloseCode.Normal.rawValue)
-
-            default:
+    
+    ///disconnect from the websocket server
+    public func disconnect(forceTimeout: Int = 0) {
+        writeError(CloseCode.Normal.rawValue)
+        if forceTimeout > 0 { //not needed most of the time, for an edge case
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, Int64(forceTimeout) * Int64(NSEC_PER_SEC)), queue, { [unowned self] in
                 self.disconnectStream(nil)
-                break
+            })
         }
     }
     
@@ -191,6 +168,11 @@ public class WebSocket : NSObject, NSStreamDelegate {
     public func writePing(data: NSData) {
         dequeueWrite(data, code: .Ping)
     }
+
+    public func writePong(data: NSData) {
+        dequeueWrite(data, code: .Pong)
+    }
+
     //private methods below!
     
     //private method that starts the connection
@@ -545,14 +527,15 @@ public class WebSocket : NSObject, NSStreamDelegate {
             } else {
                 data = NSData(bytes: UnsafePointer<UInt8>((buffer+offset)), length: Int(len))
             }
-            if receivedOpcode == OpCode.Pong.rawValue {
+            
+            if receivedOpcode == OpCode.Ping.rawValue {
                 dispatch_async(queue,{ [weak self] in
                     guard let s = self else { return }
                     if let pongBlock = s.onPong {
                         pongBlock()
                     }
-                    s.pongDelegate?.websocketDidReceivePong(s)
-                })
+                    s.pongDelegate?.websocketDidReceivePing(s)
+                    })
                 
                 let step = Int(offset+numericCast(len))
                 let extra = bufferLen-step
@@ -561,6 +544,24 @@ public class WebSocket : NSObject, NSStreamDelegate {
                 }
                 return
             }
+            
+            if receivedOpcode == OpCode.Pong.rawValue {
+                dispatch_async(queue,{ [weak self] in
+                    guard let s = self else { return }
+                    if let pingBlock = s.onPing {
+                        pingBlock()
+                    }
+                    s.pongDelegate?.websocketDidReceivePong(s)
+                    })
+                
+                let step = Int(offset+numericCast(len))
+                let extra = bufferLen-step
+                if extra > 0 {
+                    processRawMessage((buffer+step), bufferLen: extra)
+                }
+                return
+            }
+            
             var response = readStack.last
             if isControlFrame {
                 response = nil //don't append pings
